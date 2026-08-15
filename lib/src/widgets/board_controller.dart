@@ -368,7 +368,10 @@ class ChessboardController extends ChangeNotifier {
     } else {
       _premoveBasePieces = advancedBase;
       _premoveNotifier.value = _premoveQueue.first;
-      _rebuildPremovePreview();
+      if (!_rebuildPremovePreview()) {
+        _clearPremoves(restoreAuthoritativePieces: true);
+        return move;
+      }
     }
     notifyListeners();
     return move;
@@ -523,8 +526,7 @@ class ChessboardController extends ChangeNotifier {
         _premoveBasePieces = null;
         _premoveNotifier.value = null;
       }
-      final newPieces =
-          resetPremove ? authoritative : _displayPiecesForAuthoritative(authoritative);
+      final newPieces = resetPremove ? authoritative : _displayPiecesForAuthoritative(authoritative);
 
       if ((_animationController?.duration ?? Duration.zero) > Duration.zero) {
         final (tp, fp) = preparePieceAnimations(oldPieces, newPieces, lastDrop: lastDrop);
