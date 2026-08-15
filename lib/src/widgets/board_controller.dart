@@ -12,8 +12,8 @@ import '../models.dart';
 /// ## Interactivity
 ///
 /// A controller drives a [Chessboard]. To make the board non-interactive (e.g.
-/// at the end of a game), update it with game data whose `playerSide` is
-/// [PlayerSide.none]. For a fully static board, use [StaticChessboard] instead.
+/// at the end of a game), update it with game data whose `playerSide` is [PlayerSide.none].
+/// For a fully static board, use [StaticChessboard] instead.
 ///
 /// ## Updating the position
 ///
@@ -23,9 +23,15 @@ import '../models.dart';
 ///
 /// ## Premoves
 ///
-/// Read [premove] or subscribe to [premoveNotifier] to detect a pending premove.
-/// The parent is responsible for executing the premove at the right time (after
-/// the opponent moves) and for clearing it with `premove = null` when needed.
+/// Read [premove] or subscribe to [premoveNotifier] to detect the next pending premove.
+/// By default [maxPremoveCount] is `1`, preserving the historical single-premove behavior.
+/// Set it above `1` to queue several premoves. In that mode the board pieces are shown in a
+/// speculative preview position obtained by applying the queued moves in order, while [fen] and
+/// [game] continue to describe the latest authoritative position supplied by the parent.
+///
+/// The parent remains responsible for validating and executing the next premove after the opponent
+/// moves. Once the head has been accepted, call [consumePremove] before submitting that move. If it
+/// is no longer legal, clear the queue with `premove = null` or [clearPremoves].
 ///
 /// ## Drawn shapes
 ///
@@ -53,6 +59,9 @@ class ChessboardController extends ChangeNotifier {
 
   Move? _lastDropMove;
   Set<Square>? _pendingExplosionSquares;
+  final List<Move> _premoveQueue = [];
+  Pieces? _premoveBasePieces;
+  int _maxPremoveCount = 1;
 
   late final ValueNotifier<GameData> _gameNotifier;
   late final ValueNotifier<Pieces> _piecesNotifier;
@@ -75,10 +84,60 @@ class ChessboardController extends ChangeNotifier {
   bool get interactive => _gameNotifier.value.playerSide != PlayerSide.none;
   Pieces get pieces => _piecesNotifier.value;
 
-  /// The currently registered premove, or `null` if none is set.
+  /// The next registered premove, or `null` if the queue is empty.
+  ///
+  /// This remains source-compatible with the historical single-premove API. In multiple-premove
+  /// mode it is simply the head of [premoveQueue].
   Move? get premove => _premoveNotifier.value;
 
-  /// A notifier that fires whenever the premove is set or cleared.
+  /// Pending premoves in execution order.
+  List<Move> get premoveQueue => List.unmodifiable(_premoveQueue);
+
+  /// Maximum number of premoves that may be queued.
+  ///
+  /// The default value `1` preserves the legacy behavior. Values greater than `1` enable a
+  /// speculative board preview so the destination of one premove can immediately become the
+  /// origin of the next one.
+  int get maxPremoveCount => _maxPremoveCount;
+  set maxPremoveCount(int value) {
+    if (value < 1) {
+      throw ArgumentError.value(value, 'maxPremoveCount', 'must be at least 1');
+    }
+    if (value == _maxPremoveCount) return;
+
+    final wasMultiple = _maxPremoveCount > 1;
+    _maxPremoveCount = value;
+
+    if (_premoveQueue.isEmpty) return;
+
+    if (value == 1) {
+      // Switching back to single mode keeps only the current head and restores the authoritative
+      // pieces, matching the historical no-preview behavior.
+      final head = _premoveQueue.first;
+      if (wasMultiple && _premoveBasePieces != null) {
+        _piecesNotifier.value = Map<Square, Piece>.from(_premoveBasePieces!);
+      }
+      _premoveQueue
+        ..clear()
+        ..add(head);
+      _premoveBasePieces = null;
+      _premoveNotifier.value = head;
+      notifyListeners();
+    } else if (!wasMultiple) {
+      // Enabling multiple mode while a single premove is already pending: use the current board as
+      // the authoritative base and turn that existing head into the first speculative move.
+      _premoveBasePieces = Map<Square, Piece>.from(_piecesNotifier.value);
+      _rebuildPremovePreview();
+      notifyListeners();
+    } else if (_premoveQueue.length > value) {
+      _premoveQueue.removeRange(value, _premoveQueue.length);
+      _rebuildPremovePreview();
+      _premoveNotifier.value = _premoveQueue.firstOrNull;
+      notifyListeners();
+    }
+  }
+
+  /// A notifier that fires whenever the queue head is set or cleared.
   ///
   /// Useful for parents that need to react to premove changes outside the board
   /// (e.g. updating pocket highlights, analytics, or haptic feedback).
@@ -123,7 +182,7 @@ class ChessboardController extends ChangeNotifier {
 
   @internal
   void attachTo(TickerProvider vsync, Duration animationDuration) {
-    assert(_animationController == null, 'ChessboardController is already attached.');
+    assert(_animationController == null, 'ChessboardController is already attached to a board.');
     _animationController = AnimationController(
       animationBehavior: AnimationBehavior.preserve,
       duration: animationDuration,
@@ -190,18 +249,167 @@ class ChessboardController extends ChangeNotifier {
     _animationController?.duration = value;
   }
 
+  // --- Premove helpers ---
+
+  Side? get _playerColor => switch (_gameNotifier.value.playerSide) {
+    PlayerSide.white => Side.white,
+    PlayerSide.black => Side.black,
+    _ => null,
+  };
+
+  bool _tryPreviewCastle(Pieces pieces, Piece king, Square from, Square to) {
+    if (king.role != Role.king || from.rank != to.rank) return false;
+
+    Square? rookSquare;
+    final destinationPiece = pieces[to];
+    if (destinationPiece?.role == Role.rook && destinationPiece?.color == king.color) {
+      rookSquare = to;
+    } else if (to.file == 6) {
+      final candidate = Square.fromCoords(File(7), from.rank);
+      final rook = pieces[candidate];
+      if (rook?.role == Role.rook && rook?.color == king.color) rookSquare = candidate;
+    } else if (to.file == 2) {
+      final candidate = Square.fromCoords(File(0), from.rank);
+      final rook = pieces[candidate];
+      if (rook?.role == Role.rook && rook?.color == king.color) rookSquare = candidate;
+    }
+
+    if (rookSquare == null) return false;
+
+    final kingDestFile = rookSquare.file > from.file ? 6 : 2;
+    final rookDestFile = rookSquare.file > from.file ? 5 : 3;
+    final kingDest = Square.fromCoords(File(kingDestFile), from.rank);
+    final rookDest = Square.fromCoords(File(rookDestFile), from.rank);
+    final rook = pieces[rookSquare]!;
+
+    pieces
+      ..remove(from)
+      ..remove(rookSquare)
+      ..[kingDest] = king
+      ..[rookDest] = rook;
+    return true;
+  }
+
+  bool _applyPreviewMove(Pieces pieces, Move move) {
+    switch (move) {
+      case NormalMove(:final from, :final to, :final promotion):
+        final piece = pieces[from];
+        if (piece == null || from == to) return false;
+        if (_tryPreviewCastle(pieces, piece, from, to)) return true;
+        pieces.remove(from);
+        pieces[to] = promotion != null ? piece.copyWith(role: promotion, promoted: true) : piece;
+        return true;
+      case DropMove(:final to, :final role):
+        final color = _playerColor;
+        if (color == null) return false;
+        pieces[to] = Piece(role: role, color: color);
+        return true;
+    }
+  }
+
+  bool _rebuildPremovePreview() {
+    if (_maxPremoveCount <= 1 || _premoveQueue.isEmpty) return true;
+    final base = _premoveBasePieces;
+    if (base == null) return false;
+    final preview = Map<Square, Piece>.from(base);
+    for (final move in _premoveQueue) {
+      if (!_applyPreviewMove(preview, move)) {
+        _piecesNotifier.value = Map<Square, Piece>.from(base);
+        return false;
+      }
+    }
+    _piecesNotifier.value = preview;
+    return true;
+  }
+
+  void _clearPremoves({required bool restoreAuthoritativePieces}) {
+    if (restoreAuthoritativePieces && _premoveBasePieces != null) {
+      _piecesNotifier.value = Map<Square, Piece>.from(_premoveBasePieces!);
+    }
+    _premoveQueue.clear();
+    _premoveBasePieces = null;
+    _premoveNotifier.value = null;
+    notifyListeners();
+  }
+
+  /// Removes and returns the head premove after the parent has validated it.
+  ///
+  /// In multiple-premove mode this advances the speculative base by that move and preserves the
+  /// remaining tail. The next authoritative [updatePosition] will replace that predicted base with
+  /// the server-confirmed position and reapply the tail.
+  Move? consumePremove() {
+    if (_premoveQueue.isEmpty) return null;
+    final move = _premoveQueue.first;
+
+    if (_maxPremoveCount <= 1) {
+      _premoveQueue.clear();
+      _premoveNotifier.value = null;
+      notifyListeners();
+      return move;
+    }
+
+    final base = _premoveBasePieces;
+    if (base == null) {
+      _clearPremoves(restoreAuthoritativePieces: false);
+      return move;
+    }
+
+    final advancedBase = Map<Square, Piece>.from(base);
+    if (!_applyPreviewMove(advancedBase, move)) {
+      _clearPremoves(restoreAuthoritativePieces: true);
+      return move;
+    }
+
+    _premoveQueue.removeAt(0);
+    if (_premoveQueue.isEmpty) {
+      _premoveBasePieces = null;
+      _piecesNotifier.value = advancedBase;
+      _premoveNotifier.value = null;
+    } else {
+      _premoveBasePieces = advancedBase;
+      _premoveNotifier.value = _premoveQueue.first;
+      _rebuildPremovePreview();
+    }
+    notifyListeners();
+    return move;
+  }
+
+  /// Clears every queued premove and restores the latest authoritative board position.
+  void clearPremoves() => _clearPremoves(restoreAuthoritativePieces: true);
+
   // --- Public mutation API ---
 
-  /// Sets or clears the premove.
+  /// Sets, queues, or clears a premove.
   ///
-  /// Assign a non-null [Move] to register a premove, or `null` to clear it.
-  /// The board updates its highlight display immediately.
-  ///
-  /// The parent is still responsible for executing the premove at the right time
-  /// (typically after the opponent moves). Read [premove] or listen to [premoveNotifier]
-  /// to know when a premove is pending.
+  /// With the default [maxPremoveCount] of `1`, assigning a non-null [Move] replaces the existing
+  /// premove exactly as before and does not move any displayed pieces. When [maxPremoveCount] is
+  /// greater than `1`, non-null assignments append to the queue and immediately advance the
+  /// speculative preview. Assign `null` to clear the complete queue.
   set premove(Move? move) {
-    _premoveNotifier.value = move;
+    if (move == null) {
+      _clearPremoves(restoreAuthoritativePieces: true);
+      return;
+    }
+
+    if (_maxPremoveCount <= 1) {
+      _premoveQueue
+        ..clear()
+        ..add(move);
+      _premoveBasePieces = null;
+      _premoveNotifier.value = move;
+      return;
+    }
+
+    if (_premoveQueue.length >= _maxPremoveCount) return;
+    _premoveBasePieces ??= Map<Square, Piece>.from(_piecesNotifier.value);
+
+    final preview = Map<Square, Piece>.from(_piecesNotifier.value);
+    if (!_applyPreviewMove(preview, move)) return;
+
+    _premoveQueue.add(move);
+    _piecesNotifier.value = preview;
+    _premoveNotifier.value = _premoveQueue.first;
+    notifyListeners();
   }
 
   /// The pending promotion move, or `null` when no promotion is in progress.
@@ -254,15 +462,30 @@ class ChessboardController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Pieces _displayPiecesForAuthoritative(Pieces authoritative) {
+    if (_maxPremoveCount <= 1 || _premoveQueue.isEmpty) {
+      _premoveBasePieces = null;
+      return authoritative;
+    }
+
+    _premoveBasePieces = Map<Square, Piece>.from(authoritative);
+    final preview = Map<Square, Piece>.from(authoritative);
+    for (final move in _premoveQueue) {
+      if (!_applyPreviewMove(preview, move)) return authoritative;
+    }
+    return preview;
+  }
+
   /// Updates the board to [game].
   ///
   /// By default, pieces are animated to their new positions. Pass
   /// `animate: false` to switch positions instantly (e.g. analysis seeking or
   /// history navigation).
   ///
-  /// By default, any registered premove is preserved. Pass `resetPremove: true`
-  /// to clear it — appropriate whenever the new position is not a direct
-  /// continuation of the current one (e.g. jumping to an arbitrary position).
+  /// By default, any registered premove is preserved. In multiple-premove mode the new FEN becomes
+  /// the authoritative preview base and the still-pending queue is reapplied on top of it. Pass
+  /// `resetPremove: true` to clear the complete queue — appropriate whenever the new position is not
+  /// a direct continuation of the current one (e.g. jumping to an arbitrary position).
   ///
   /// If the triggering move was performed via drag and drop (recorded by the
   /// board through [recordDropMove]), the animation engine automatically
@@ -273,9 +496,16 @@ class ChessboardController extends ChangeNotifier {
       _translatingPiecesNotifier.value = {};
       _fadingPiecesNotifier.value = {};
       _lastDropMove = null;
-      _piecesNotifier.value = readFen(game.fen);
+      final authoritative = readFen(game.fen);
+      if (resetPremove) {
+        _premoveQueue.clear();
+        _premoveBasePieces = null;
+        _premoveNotifier.value = null;
+        _piecesNotifier.value = authoritative;
+      } else {
+        _piecesNotifier.value = _displayPiecesForAuthoritative(authoritative);
+      }
       _gameNotifier.value = game;
-      if (resetPremove) _premoveNotifier.value = null;
       notifyListeners();
       return;
     }
@@ -287,7 +517,14 @@ class ChessboardController extends ChangeNotifier {
       _translatingPiecesNotifier.value = {};
       _fadingPiecesNotifier.value = {};
 
-      final newPieces = readFen(game.fen);
+      final authoritative = readFen(game.fen);
+      if (resetPremove) {
+        _premoveQueue.clear();
+        _premoveBasePieces = null;
+        _premoveNotifier.value = null;
+      }
+      final newPieces =
+          resetPremove ? authoritative : _displayPiecesForAuthoritative(authoritative);
 
       if ((_animationController?.duration ?? Duration.zero) > Duration.zero) {
         final (tp, fp) = preparePieceAnimations(oldPieces, newPieces, lastDrop: lastDrop);
@@ -305,7 +542,9 @@ class ChessboardController extends ChangeNotifier {
     }
 
     _gameNotifier.value = game;
-    if (resetPremove) _premoveNotifier.value = null;
+    if (resetPremove && game.fen == fen) {
+      _clearPremoves(restoreAuthoritativePieces: true);
+    }
 
     notifyListeners();
   }
