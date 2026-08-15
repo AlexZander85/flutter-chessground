@@ -59,6 +59,75 @@ void main() {
       expect(controller.pieces[Square.e2]?.role, Role.king);
     });
 
+    test('preview applies standard castling piece placement', () {
+      controller.dispose();
+      controller = ChessboardController(
+        game: _game(
+          fen: '4k3/8/8/8/8/8/8/4K2R b - - 0 1',
+          sideToMove: Side.black,
+        ),
+      );
+      controller.maxPremoveCount = 4;
+
+      controller.premove = _move(Square.e1, Square.g1);
+
+      expect(controller.pieces[Square.e1], isNull);
+      expect(controller.pieces[Square.h1], isNull);
+      expect(controller.pieces[Square.g1]?.role, Role.king);
+      expect(controller.pieces[Square.f1]?.role, Role.rook);
+    });
+
+    test('preview accepts king-to-rook castling notation', () {
+      controller.dispose();
+      controller = ChessboardController(
+        game: _game(
+          fen: '4k3/8/8/8/8/8/8/1K1R4 b - - 0 1',
+          sideToMove: Side.black,
+        ),
+      );
+      controller.maxPremoveCount = 4;
+
+      controller.premove = _move(Square.b1, Square.d1);
+
+      expect(controller.pieces[Square.b1], isNull);
+      expect(controller.pieces[Square.d1], isNull);
+      expect(controller.pieces[Square.g1]?.role, Role.king);
+      expect(controller.pieces[Square.f1]?.role, Role.rook);
+    });
+
+    test('preview applies an explicit promotion role', () {
+      controller.dispose();
+      controller = ChessboardController(
+        game: _game(
+          fen: '7k/6P1/8/8/8/8/8/6K1 b - - 0 1',
+          sideToMove: Side.black,
+        ),
+      );
+      controller.maxPremoveCount = 4;
+      final promotion = NormalMove(from: Square.g7, to: Square.g8, promotion: Role.queen);
+
+      controller.premove = promotion;
+
+      expect(controller.pieces[Square.g7], isNull);
+      expect(controller.pieces[Square.g8]?.role, Role.queen);
+      expect(controller.pieces[Square.g8]?.promoted, isTrue);
+    });
+
+    test('preview can continue from a queued drop', () {
+      controller.maxPremoveCount = 4;
+      final drop = DropMove(to: Square.e4, role: Role.knight);
+      final followUp = _move(Square.e4, Square.f6);
+
+      controller
+        ..premove = drop
+        ..premove = followUp;
+
+      expect(controller.premoveQueue, [drop, followUp]);
+      expect(controller.pieces[Square.e4], isNull);
+      expect(controller.pieces[Square.f6]?.role, Role.knight);
+      expect(controller.pieces[Square.f6]?.color, Side.white);
+    });
+
     test('authoritative update is used as a new base while keeping the queue preview', () {
       controller.maxPremoveCount = 4;
       final first = _move(Square.g2, Square.f2);
