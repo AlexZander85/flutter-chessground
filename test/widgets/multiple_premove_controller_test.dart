@@ -102,6 +102,37 @@ void main() {
       expect(controller.pieces[Square.e2]?.role, Role.king);
     });
 
+    test('consuming a legal head clears a tail invalidated by the authoritative position', () {
+      controller.dispose();
+      controller = ChessboardController(
+        game: _game(
+          fen: '7k/8/8/8/8/8/6K1/R7 b - - 0 1',
+          sideToMove: Side.black,
+        ),
+      );
+      controller.maxPremoveCount = 4;
+      final first = _move(Square.g2, Square.f2);
+      final second = _move(Square.a1, Square.a2);
+      controller
+        ..premove = first
+        ..premove = second;
+
+      // The opponent's move removed the rook from a1. The king premove is still
+      // valid, but the dependent rook premove can no longer be previewed.
+      controller.updatePosition(
+        _game(
+          fen: '8/7k/8/8/8/8/6K1/8 w - - 1 2',
+          sideToMove: Side.white,
+        ),
+        animate: false,
+      );
+
+      expect(controller.consumePremove(), first);
+      expect(controller.premove, isNull);
+      expect(controller.premoveQueue, isEmpty);
+      expect(controller.pieces[Square.f2]?.role, Role.king);
+    });
+
     test('clearing an invalid queue restores the latest authoritative position', () {
       controller.maxPremoveCount = 4;
       controller
